@@ -89,6 +89,9 @@ main.screen { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 /* ── スキャン画面 ── */
 #cameraWrap { position: relative; flex: 1; min-height: 0; background: #000; overflow: hidden; }
 #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+#overlayCanvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 2; }
+#aimFrame { z-index: 3; }
+#scanHint { z-index: 4; }
 #aimFrame {
 position: absolute; left: 50%; top: 46%; transform: translate(-50%, -50%);
 width: min(62vmin, 300px); height: min(62vmin, 300px); pointer-events: none;
@@ -137,7 +140,7 @@ border-radius: 8px; font-size: 15px; padding: 12px 22px;
 .lsc.ok .lsc-head { color: #2e7d32; }
 .lsc.dup .lsc-head { color: #8d6e00; }
 .lsc.warn .lsc-head { color: #b71c1c; }
-.lsc-title { font-size: 14px; font-weight: 600; line-height: 1.4; word-break: break-all; }
+.lsc-title { font-size: 15px; font-weight: 700; line-height: 1.4; word-break: break-all; }
 .lsc-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
 .lsc-warntext { font-size: 12px; color: #b71c1c; font-weight: 700; margin-top: 2px; }
 
@@ -349,10 +352,11 @@ display: flex; flex-direction: column; gap: 5px; max-width: 250px;
 <div id="cameraWrap">
 <div id="cameraLive" class="hidden">
 <video id="video" playsinline muted autoplay></video>
+<canvas id="overlayCanvas"></canvas>
 <div id="aimFrame">
 <div class="aim-c tl"></div><div class="aim-c tr"></div><div class="aim-c bl"></div><div class="aim-c br"></div>
 </div>
-<div id="scanHint">版のQRコードを枠に合わせてください</div>
+<div id="scanHint">読みたい版のQRを中央の照準に合わせてください（照準内だけ読み取ります）</div>
 <button id="stopBtn" onclick="stopCamera()">⏸ 停止</button>
 <button id="torchBtn" class="hidden">🔦 ライト</button>
 </div>
@@ -13341,7 +13345,7 @@ document.getElementById('cameraIdle').classList.add('hidden');
 document.getElementById('cameraLive').classList.remove('hidden');
 setupTorchBtn();
 requestWakeLock();
-_lastProc = 0;
+resetScanEngine();
 requestAnimationFrame(rafLoop);
 }).catch(function(err) {
 showCamError(camMessage(err));
@@ -13354,6 +13358,7 @@ stream = null; videoTrack = null; torchOn = false;
 releaseWakeLock();
 var v = document.getElementById('video');
 try { v.srcObject = null; } catch (e) {}
+clearOverlayNow();
 document.getElementById('cameraLive').classList.add('hidden');
 document.getElementById('cameraError').classList.add('hidden');
 document.getElementById('cameraIdle').classList.remove('hidden');
@@ -13379,17 +13384,340 @@ return 'カメラを起動できませんでした。他のアプリがカメラ
 return 'カメラエラー: ' + ((err && err.message) || err) + '\n読み取れない場合は「手入力」をご利用ください。';
 }
 
-/* 単一 requestAnimationFrame ループ・約10fpsでサンプリング（CPU過熱防止） */
-var _lastProc = 0;
+/* ═══════════════════════════════════════════════════════════
+   スキャンエンジン v2（2026-07-12b・現場フィードバック対応）
+   [改良A] 照準ゾーン採用: 画面中央の照準内に「中心」があるQRだけ採用
+           （隣接ラベルの誤読みを構造的に防止）。QR位置にAR風の枠を毎フレーム描画:
+           緑=新規読取（版名ポップ付き）/ 黄=読取済み「済」/ 赤=台帳外・対象外（理由付き）/
+           薄枠=照準外（「読むにはここへ」誘導）。読取済みは映してもビープ再生しない（黄枠で分かる）。
+   [改良B] 高速化: デコードは照準ゾーンの小領域クロップのみ（処理量激減）＋
+           rAF毎フレーム試行（固定10fps間引きを撤廃・処理中はスキップ）＋
+           BarcodeDetector APIをフィーチャーディテクト（対応環境はネイティブ検出・
+           非対応/失敗時は自動でjsQRへ）。全画面検出は薄枠誘導用に約3fpsで別途実行し、採用は照準内のみ。
+   ═══════════════════════════════════════════════════════════ */
+var SCAN = {
+reticleDet: null,   // 直近の照準内検出 {data, corners(画面座標), center, kind, at}
+fullDets: [],       // 照準外の薄枠用検出 [{data, corners, center, at}]
+popups: [],         // 新規読取ポップ [{lines, x, y, until, warn}]
+lastFullScan: 0,
+nativeBusy: false, nativeFullBusy: false,
+geo: null,
+};
+function resetScanEngine() {
+SCAN.reticleDet = null; SCAN.fullDets = []; SCAN.popups = [];
+SCAN.lastFullScan = 0; SCAN.nativeBusy = false; SCAN.nativeFullBusy = false; SCAN.geo = null;
+}
+
+/* BarcodeDetector フィーチャーディテクト（qr_code対応時のみ採用・iOS等の未対応環境は自動でjsQR） */
+var nativeDetector = null;
+(function() {
+try {
+if (typeof BarcodeDetector !== 'undefined' && BarcodeDetector.getSupportedFormats) {
+BarcodeDetector.getSupportedFormats().then(function(fs) {
+if (fs && fs.indexOf('qr_code') >= 0) nativeDetector = new BarcodeDetector({ formats: ['qr_code'] });
+}).catch(function() {});
+}
+} catch (e) {}
+})();
+
+/* ── ジオメトリ（object-fit:cover の video座標⇔画面座標） ── */
+function coverGeometry(vw, vh, ww, wh) {
+var scale = Math.max(ww / vw, wh / vh);
+return { vw: vw, vh: vh, ww: ww, wh: wh, scale: scale, dx: (ww - vw * scale) / 2, dy: (wh - vh * scale) / 2 };
+}
+function videoToScreenPt(p, g) { return { x: p.x * g.scale + g.dx, y: p.y * g.scale + g.dy }; }
+function screenRectToVideo(rect, g) {
+var x1 = Math.max(0, Math.min(g.vw, (rect.x - g.dx) / g.scale));
+var y1 = Math.max(0, Math.min(g.vh, (rect.y - g.dy) / g.scale));
+var x2 = Math.max(0, Math.min(g.vw, (rect.x + rect.w - g.dx) / g.scale));
+var y2 = Math.max(0, Math.min(g.vh, (rect.y + rect.h - g.dy) / g.scale));
+return { x: x1, y: y1, w: Math.max(1, x2 - x1), h: Math.max(1, y2 - y1) };
+}
+/* 照準ゾーン（画面座標） */
+function reticleRect(g) {
+var size = Math.min(0.62 * Math.min(g.ww, g.wh), 300);
+return { x: g.ww / 2 - size / 2, y: g.wh * 0.46 - size / 2, w: size, h: size };
+}
+var _aimSig = '';
+function positionAimFrame(g) {
+var r = reticleRect(g);
+var sig = [r.x, r.y, r.w].join(',');
+if (sig === _aimSig) return;
+_aimSig = sig;
+var el = document.getElementById('aimFrame');
+el.style.left = r.x + 'px'; el.style.top = r.y + 'px';
+el.style.width = r.w + 'px'; el.style.height = r.h + 'px';
+el.style.transform = 'none';
+}
+function updateGeometry() {
+if (window.__testGeometry) { SCAN.geo = window.__testGeometry; positionAimFrame(SCAN.geo); return SCAN.geo; } // 機械テスト用フック
+var v = document.getElementById('video');
+var wrap = document.getElementById('cameraWrap');
+if (!v.videoWidth || !wrap.clientWidth) return null;
+SCAN.geo = coverGeometry(v.videoWidth, v.videoHeight, wrap.clientWidth, wrap.clientHeight);
+positionAimFrame(SCAN.geo);
+return SCAN.geo;
+}
+
+/* ── 検出（video座標の矩形をmaxDimに縮小してQR検出・結果はvideo座標の四隅） ── */
+var detCanvas = document.createElement('canvas');
+var detCtx = detCanvas.getContext('2d', { willReadFrequently: true });
+function decodeRegionJsQR(source, sx, sy, sw, sh, maxDim) {
+var scale = Math.min(1, maxDim / Math.max(sw, sh));
+var w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
+if (detCanvas.width !== w) detCanvas.width = w;
+if (detCanvas.height !== h) detCanvas.height = h;
+detCtx.fillStyle = '#fff';
+detCtx.fillRect(0, 0, w, h);
+try { detCtx.drawImage(source, sx, sy, sw, sh, 0, 0, w, h); } catch (e) { return null; }
+var img;
+try { img = detCtx.getImageData(0, 0, w, h); } catch (e) { return null; }
+var res = null;
+// ラベルは黒QR/白地固定 → 反転試行なし（約2倍速）
+try { res = jsQR(img.data, w, h, { inversionAttempts: 'dontInvert' }); } catch (e) { return null; }
+if (!res || !res.data) return null;
+var L = res.location;
+var back = function(p) { return { x: sx + p.x / scale, y: sy + p.y / scale }; };
+return [{ data: res.data, corners: [back(L.topLeftCorner), back(L.topRightCorner), back(L.bottomRightCorner), back(L.bottomLeftCorner)] }];
+}
+var natCanvas = document.createElement('canvas');
+var natCtx = natCanvas.getContext('2d', { willReadFrequently: true });
+function decodeRegionNative(source, sx, sy, sw, sh, maxDim, cb) {
+var scale = Math.min(1, maxDim / Math.max(sw, sh));
+var w = Math.max(1, Math.round(sw * scale)), h = Math.max(1, Math.round(sh * scale));
+if (natCanvas.width !== w) natCanvas.width = w;
+if (natCanvas.height !== h) natCanvas.height = h;
+natCtx.fillStyle = '#fff';
+natCtx.fillRect(0, 0, w, h);
+try { natCtx.drawImage(source, sx, sy, sw, sh, 0, 0, w, h); } catch (e) { cb(null); return; }
+nativeDetector.detect(natCanvas).then(function(codes) {
+var out = [];
+(codes || []).forEach(function(code) {
+var pts = (code.cornerPoints && code.cornerPoints.length === 4) ? code.cornerPoints
+: [{ x: code.boundingBox.x, y: code.boundingBox.y },
+{ x: code.boundingBox.x + code.boundingBox.width, y: code.boundingBox.y },
+{ x: code.boundingBox.x + code.boundingBox.width, y: code.boundingBox.y + code.boundingBox.height },
+{ x: code.boundingBox.x, y: code.boundingBox.y + code.boundingBox.height }];
+if (code.rawValue) out.push({ data: code.rawValue, corners: pts.map(function(p) { return { x: sx + p.x / scale, y: sy + p.y / scale }; }) });
+});
+cb(out.length ? out : null);
+}).catch(function() { nativeDetector = null; cb(null); }); // ネイティブ失敗 → 以後は自動でjsQRへ
+}
+
+/* ── メインループ（rAF毎フレーム・処理中スキップ／全画面薄枠は約3fps） ── */
 function rafLoop(ts) {
 if (!scanning) return;
 requestAnimationFrame(rafLoop);
-if (ts - _lastProc < 100) return;
-_lastProc = ts;
 var v = document.getElementById('video');
-if (v.readyState < 2) return;
-var res = decodeBitmap(v, v.videoWidth, v.videoHeight);
-if (res && res.data) handleCode(res.data);
+if (v.readyState < 2 || !v.videoWidth) return;
+var g = updateGeometry();
+if (!g) return;
+scanReticleStep(v, g, ts);
+if (ts - SCAN.lastFullScan > 333) { SCAN.lastFullScan = ts; scanFullStep(v, g, ts); }
+drawOverlay(ts);
+}
+
+function findInScanList(code) {
+for (var i = 0; i < scanList.length; i++) { if (scanList[i].fileId === code) return scanList[i]; }
+return null;
+}
+/* オーバーレイ用の分類: new=緑（未リスト・解版可能） / done=黄（リスト済み） / warn=赤（警告） */
+function classifyDetection(data) {
+var item = findInScanList(data);
+if (item) return item.warn ? 'warn' : 'done';
+var p = rosterByFid[data];
+if (!p) return 'warn';
+if (p.status !== VALID_SOURCE) return 'warn';
+return 'new';
+}
+
+function scanReticleStep(v, g, ts) {
+var r = reticleRect(g);
+var pad = r.w * 0.25; // 中心が照準内ならQRの端がはみ出ても読めるよう、ひと回り大きくクロップ
+var crop = screenRectToVideo({ x: r.x - pad, y: r.y - pad, w: r.w + pad * 2, h: r.h + pad * 2 }, g);
+if (nativeDetector && !window.__noNative) {
+if (SCAN.nativeBusy) return;
+SCAN.nativeBusy = true;
+decodeRegionNative(v, crop.x, crop.y, crop.w, crop.h, 400, function(list) {
+SCAN.nativeBusy = false;
+if (list) list.forEach(function(d) { processReticleResult(d, g, performance.now()); });
+});
+} else {
+var list = decodeRegionJsQR(v, crop.x, crop.y, crop.w, crop.h, 400);
+if (list) list.forEach(function(d) { processReticleResult(d, g, ts); });
+}
+}
+
+function polyCenter(pts) {
+var x = 0, y = 0;
+for (var i = 0; i < pts.length; i++) { x += pts[i].x; y += pts[i].y; }
+return { x: x / pts.length, y: y / pts.length };
+}
+
+/* 照準内判定→採用（video座標の検出1件を処理）。照準外なら薄枠へ回す */
+function processReticleResult(d, g, ts) {
+var cs = d.corners.map(function(p) { return videoToScreenPt(p, g); });
+var c = polyCenter(cs);
+var r = reticleRect(g);
+var inside = (c.x >= r.x && c.x <= r.x + r.w && c.y >= r.y && c.y <= r.y + r.h);
+if (!inside) { pushFullDet(d.data, cs, c, ts); return; } // 照準外＝採用しない（誤読み防止）
+var wasInList = !!findInScanList(d.data);
+if (!wasInList) handleCode(d.data); // 新規のみ採用（済のものはビープなし＝黄枠で表示）
+var kind = classifyDetection(d.data);
+if (!wasInList) {
+var item = findInScanList(d.data);
+if (item) {
+SCAN.popups.push({
+lines: [trunc(item.title, 26), item.work ? '作品: ' + trunc(item.work, 22) : ''],
+x: c.x, y: Math.min(cs[0].y, cs[1].y) - 12, until: ts + 1100, warn: !!item.warn,
+});
+kind = item.warn ? 'warn' : 'new';
+}
+}
+SCAN.reticleDet = { data: d.data, corners: cs, center: c, kind: kind, at: ts };
+}
+
+function pushFullDet(data, cornersScreen, centerScreen, ts) {
+for (var i = 0; i < SCAN.fullDets.length; i++) {
+if (SCAN.fullDets[i].data === data) {
+SCAN.fullDets[i] = { data: data, corners: cornersScreen, center: centerScreen, at: ts };
+return;
+}
+}
+SCAN.fullDets.push({ data: data, corners: cornersScreen, center: centerScreen, at: ts });
+}
+
+/* 全画面の薄枠検出（約3fps・採用はしない＝照準への誘導表示のみ） */
+function scanFullStep(v, g, ts) {
+var handle = function(list) {
+if (!list) return;
+var r = reticleRect(g);
+list.forEach(function(d) {
+var cs = d.corners.map(function(p) { return videoToScreenPt(p, g); });
+var c = polyCenter(cs);
+var inside = (c.x >= r.x && c.x <= r.x + r.w && c.y >= r.y && c.y <= r.y + r.h);
+if (!inside) pushFullDet(d.data, cs, c, ts);
+});
+};
+if (nativeDetector && !window.__noNative) {
+if (SCAN.nativeFullBusy) return;
+SCAN.nativeFullBusy = true;
+decodeRegionNative(v, 0, 0, g.vw, g.vh, 480, function(list) { SCAN.nativeFullBusy = false; handle(list); });
+} else {
+handle(decodeRegionJsQR(v, 0, 0, g.vw, g.vh, 480));
+}
+}
+
+/* ── オーバーレイ描画 ── */
+var OVERLAY_COLORS = { 'new': '#00e676', done: '#ffd600', warn: '#ff5252', faint: 'rgba(255,255,255,.55)' };
+function sizeOverlay() {
+var cv = document.getElementById('overlayCanvas');
+var wrap = document.getElementById('cameraWrap');
+var dpr = window.devicePixelRatio || 1;
+var w = Math.max(1, wrap.clientWidth), h = Math.max(1, wrap.clientHeight);
+if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+}
+var ctx = cv.getContext('2d');
+ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+return ctx;
+}
+function clearOverlayNow() {
+try {
+var ctx = sizeOverlay();
+var wrap = document.getElementById('cameraWrap');
+ctx.clearRect(0, 0, wrap.clientWidth, wrap.clientHeight);
+} catch (e) {}
+}
+function strokePoly(ctx, pts, color, width, glow) {
+ctx.save();
+ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineJoin = 'round';
+if (glow) { ctx.shadowColor = color; ctx.shadowBlur = 9; }
+ctx.beginPath();
+ctx.moveTo(pts[0].x, pts[0].y);
+for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+ctx.closePath();
+ctx.stroke();
+ctx.restore();
+}
+function chipDraw(ctx, x, y, text, bg, fg) {
+ctx.save();
+ctx.font = 'bold 13px -apple-system, BlinkMacSystemFont, sans-serif';
+var w = ctx.measureText(text).width + 14, h = 22, rr = 6;
+ctx.fillStyle = bg;
+ctx.beginPath();
+ctx.moveTo(x + rr, y);
+ctx.arcTo(x + w, y, x + w, y + h, rr);
+ctx.arcTo(x + w, y + h, x, y + h, rr);
+ctx.arcTo(x, y + h, x, y, rr);
+ctx.arcTo(x, y, x + w, y, rr);
+ctx.closePath();
+ctx.fill();
+ctx.fillStyle = fg;
+ctx.textBaseline = 'middle';
+ctx.fillText(text, x + 7, y + h / 2 + 1);
+ctx.restore();
+}
+function drawOverlay(ts) {
+var ctx = sizeOverlay();
+var wrap = document.getElementById('cameraWrap');
+ctx.clearRect(0, 0, wrap.clientWidth, wrap.clientHeight);
+if (!scanning && !window.__overlayTestMode) return;
+var g = SCAN.geo || updateGeometry();
+if (!g) return;
+var r = reticleRect(g);
+// 照準外を薄暗く（「読むにはここへ」の誘導）
+ctx.fillStyle = 'rgba(0,0,0,.32)';
+ctx.fillRect(0, 0, g.ww, r.y);
+ctx.fillRect(0, r.y + r.h, g.ww, Math.max(0, g.wh - r.y - r.h));
+ctx.fillRect(0, r.y, r.x, r.h);
+ctx.fillRect(r.x + r.w, r.y, Math.max(0, g.ww - r.x - r.w), r.h);
+// 照準外QRの薄枠
+SCAN.fullDets = SCAN.fullDets.filter(function(d) { return ts - d.at < 900; });
+SCAN.fullDets.forEach(function(d) { strokePoly(ctx, d.corners, OVERLAY_COLORS.faint, 2, false); });
+// 照準内の検出（緑/黄/赤）
+var det = SCAN.reticleDet;
+if (det && ts - det.at < 450) {
+var col = OVERLAY_COLORS[det.kind] || OVERLAY_COLORS.done;
+strokePoly(ctx, det.corners, col, 4, true);
+var bx = Math.min(det.corners[0].x, det.corners[3].x);
+var by = Math.min(det.corners[0].y, det.corners[1].y) - 27;
+if (det.kind === 'done') {
+chipDraw(ctx, bx, by, '済（読取済み）', '#ffd600', '#333');
+} else if (det.kind === 'warn') {
+var item = findInScanList(det.data);
+var p = rosterByFid[det.data];
+var reason = item ? (item.warn === 'notfound' ? '済・台帳に無い' : '済・対象外')
+: (p ? '対象外: ' + p.status : '台帳に無い');
+chipDraw(ctx, bx, by, '⚠ ' + reason, '#e53935', '#fff');
+}
+}
+// 新規読取ポップ（版名＋作品名をその場に短時間表示）
+SCAN.popups = SCAN.popups.filter(function(p) { return ts < p.until; });
+SCAN.popups.forEach(function(p) {
+ctx.save();
+ctx.font = 'bold 13px -apple-system, BlinkMacSystemFont, sans-serif';
+var l1 = p.lines[0] || '', l2 = p.lines[1] || '';
+var w1 = ctx.measureText(l1).width;
+ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
+var w2 = ctx.measureText(l2).width;
+var bw = Math.max(w1, w2) + 18, bh = l2 ? 40 : 26;
+var bx2 = Math.max(4, Math.min(g.ww - bw - 4, p.x - bw / 2));
+var by2 = Math.max(4, p.y - bh);
+ctx.fillStyle = p.warn ? 'rgba(183,28,28,.93)' : 'rgba(27,94,32,.93)';
+ctx.beginPath();
+ctx.rect(bx2, by2, bw, bh);
+ctx.fill();
+ctx.fillStyle = '#fff';
+ctx.textBaseline = 'top';
+ctx.font = 'bold 13px -apple-system, BlinkMacSystemFont, sans-serif';
+ctx.fillText(l1, bx2 + 9, by2 + 5);
+if (l2) {
+ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
+ctx.fillText(l2, bx2 + 9, by2 + 23);
+}
+ctx.restore();
+});
 }
 
 function setupTorchBtn() {
